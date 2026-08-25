@@ -441,7 +441,7 @@ const TOOLS = [
   {id:'html2pdf', icon:'🌐', cat:'convert-to', title:'HTML to PDF', status:READY, desc:'Paste HTML or plain text and render it to a paginated PDF.'},
   {id:'word2pdf', icon:'📝', cat:'convert-to', title:'Word to PDF', status:READY, desc:'Convert a .docx file to PDF, with basic formatting preserved.'},
   {id:'excel2pdf', icon:'📈', cat:'convert-to', title:'Excel to PDF', status:READY, desc:'Convert every sheet of an .xlsx/.xls/.csv to PDF pages.'},
-  {id:'scan', icon:'📷', cat:'convert-to', title:'Scan to PDF', status:READY, desc:'Capture pages with your device camera and combine them into a PDF.'},
+  {id:'scan', icon:'📷', cat:'convert-to', title:'Scan to PDF', status:READY, desc:'Capture pages with your camera or add photos, crop and apply scan filters, then combine into a PDF.'},
   // ---- convert from pdf ----
   {id:'pdf2jpg', icon:'🖼️', cat:'convert-from', title:'PDF to Image', status:READY, desc:'Render every page as a JPG or PNG (zipped if more than one page).'},
   {id:'pdf2word', icon:'📝', cat:'convert-from', title:'PDF to Word (lite)', status:READY, desc:'Extract text into a basic, editable .docx. Layout isn\'t preserved.'},
@@ -1415,21 +1415,233 @@ BUILDERS.excel2pdf = function(){
 };
 
 // ================= SCAN TO PDF =================
+// Capture pages with the camera or import photos, crop each page and apply a
+// scan-style filter (grayscale / black & white / auto enhance / magic color /
+// sepia / invert / adaptive uneven-light), plus brightness, contrast,
+// saturation and sharpen — then combine everything into a single PDF. All
+// processing happens locally via canvas.
 BUILDERS.scan = function(){
-  let stream=null, shots=[];
-  panelShell('📷','Scan to PDF','Use your device camera to capture pages, then combine them into a PDF.', `
-    <div style="text-align:center;">
-      <video id="camVideo" autoplay playsinline style="width:100%;max-width:480px;border-radius:10px;background:#000;"></video>
-      <div style="margin-top:10px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
-        <button class="secondary" id="startCam">Enable camera</button>
-        <button class="secondary" id="capture" disabled>Capture page</button>
-        <button class="secondary" id="switchCam" disabled>Switch camera</button>
+  let stream=null, facing='environment', defaultFilter='none';
+  let shots=[]; // {orig, edited, filter, brightness, contrast, saturation, sharpen, shadowRemove, shadowStrength, crop:{x,y,w,h}|null (orig-image pixel space)}
+
+  const FILTERS = [
+    {f:'none', label:'Original'},
+    {f:'gray', label:'Grayscale'},
+    {f:'bw', label:'B &amp; W scan'},
+    {f:'enhance', label:'Enhance'},
+    {f:'magic', label:'Magic color'},
+    {f:'adaptive', label:'Uneven light'},
+    {f:'sepia', label:'Sepia'},
+    {f:'invert', label:'Invert'},
+  ];
+  function filterChipsHtml(idAttr){
+    return `<div class="chips" id="${idAttr}">${FILTERS.map(x=>`<div class="chip" data-f="${x.f}">${x.label}</div>`).join('')}</div>`;
+  }
+
+  // ---- shared pixel pipeline (used for live preview AND the final bake) ----
+  function colorPixel(d, i, filter, effB, effC, effS, cFactor){
+    let r=d[i], g=d[i+1], b=d[i+2];
+    if(filter==='gray' || filter==='bw' || filter==='enhance'){
+      const gray=0.299*r+0.587*g+0.114*b; r=g=b=gray;
+    } else if(filter==='sepia'){
+      const tr=0.393*r+0.769*g+0.189*b, tg=0.349*r+0.686*g+0.168*b, tb=0.272*r+0.534*g+0.131*b;
+      r=tr; g=tg; b=tb;
+    } else if(filter==='invert'){
+      r=255-r; g=255-g; b=255-b;
+    }
+    if(effS!==0 && filter!=='gray' && filter!=='bw' && filter!=='enhance'){
+      const gray2=0.299*r+0.587*g+0.114*b, sf=1+effS/100;
+      r=gray2+(r-gray2)*sf; g=gray2+(g-gray2)*sf; b=gray2+(b-gray2)*sf;
+    }
+    r+=effB; g+=effB; b+=effB;
+    r=cFactor*(r-128)+128; g=cFactor*(g-128)+128; b=cFactor*(b-128)+128;
+    if(filter==='bw'){ const v=((r+g+b)/3)>150?255:0; r=g=b=v; }
+    d[i]=r<0?0:r>255?255:r; d[i+1]=g<0?0:g>255?255:g; d[i+2]=b<0?0:b>255?255:b;
+  }
+  function sharpenImageData(imgData, w, h, amount){
+    if(amount<=0) return;
+    const src = imgData.data;
+    const copy = new Uint8ClampedArray(src);
+    const blurred = new Uint8ClampedArray(src.length);
+    for(let y=0;y<h;y++){
+      for(let x=0;x<w;x++){
+        let rs=0,gs=0,bs=0,count=0;
+        for(let dy=-1;dy<=1;dy++){
+          const ny=y+dy; if(ny<0||ny>=h) continue;
+          for(let dx=-1;dx<=1;dx++){
+            const nx=x+dx; if(nx<0||nx>=w) continue;
+            const idx=(ny*w+nx)*4;
+            rs+=copy[idx]; gs+=copy[idx+1]; bs+=copy[idx+2]; count++;
+          }
+        }
+        const idx=(y*w+x)*4;
+        blurred[idx]=rs/count; blurred[idx+1]=gs/count; blurred[idx+2]=bs/count;
+      }
+    }
+    for(let i=0;i<src.length;i+=4){
+      src[i]=copy[i]+amount*(copy[i]-blurred[i]);
+      src[i+1]=copy[i+1]+amount*(copy[i+1]-blurred[i+1]);
+      src[i+2]=copy[i+2]+amount*(copy[i+2]-blurred[i+2]);
+    }
+  }
+  // approximate local-adaptive threshold — good for scans with shadows or uneven lighting
+  function adaptiveThreshold(canvas, contrastAdj, brightnessAdj){
+    const w=canvas.width, h=canvas.height, ctx=canvas.getContext('2d');
+    const src = ctx.getImageData(0,0,w,h);
+    const small = document.createElement('canvas');
+    small.width = Math.max(1,Math.round(w*0.06));
+    small.height = Math.max(1,Math.round(h*0.06));
+    small.getContext('2d').drawImage(canvas,0,0,small.width,small.height);
+    const big = document.createElement('canvas'); big.width=w; big.height=h;
+    const bctx = big.getContext('2d'); bctx.imageSmoothingEnabled=true;
+    bctx.drawImage(small,0,0,w,h);
+    const localAvg = bctx.getImageData(0,0,w,h).data;
+    const d = src.data;
+    const C = 14 - (contrastAdj||0)/8 - (brightnessAdj||0)/8;
+    for(let i=0;i<d.length;i+=4){
+      const gray = 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+      const localGray = 0.299*localAvg[i]+0.587*localAvg[i+1]+0.114*localAvg[i+2];
+      const v = gray > (localGray - C) ? 255 : 0;
+      d[i]=d[i+1]=d[i+2]=v;
+    }
+    ctx.putImageData(src,0,0);
+  }
+  // Precise shadow / uneven-lighting removal.
+  // Naively blurring the whole page to estimate "background" darkens near dark
+  // text (the text pulls the local average down), which then causes pale grey
+  // halos once you divide it back out. Instead we estimate the background as
+  // the local MAXIMUM value per small block (paper is always the brightest
+  // thing in a neighbourhood, thin text strokes rarely dominate a block), then
+  // smooth that block-map back up to full size. Dividing by this cleaner
+  // background estimate flattens shadows/gradients without haloing, and
+  // correcting each channel (R/G/B) independently also removes color casts
+  // (e.g. yellowish paper under warm light) since every channel's background
+  // is normalized to the same target brightness.
+  function computeBackgroundMap(canvas, blockSize){
+    const w=canvas.width, h=canvas.height;
+    const src = canvas.getContext('2d').getImageData(0,0,w,h).data;
+    const bw = Math.max(1, Math.ceil(w/blockSize));
+    const bh = Math.max(1, Math.ceil(h/blockSize));
+    const small = document.createElement('canvas'); small.width=bw; small.height=bh;
+    const sctx = small.getContext('2d');
+    const smallData = sctx.createImageData(bw,bh);
+    for(let by=0; by<bh; by++){
+      const y0=by*blockSize, y1=Math.min(h,y0+blockSize);
+      for(let bx=0; bx<bw; bx++){
+        const x0=bx*blockSize, x1=Math.min(w,x0+blockSize);
+        let maxR=0,maxG=0,maxB=0;
+        for(let y=y0;y<y1;y++){
+          let idx=(y*w+x0)*4;
+          for(let x=x0;x<x1;x++,idx+=4){
+            if(src[idx]>maxR) maxR=src[idx];
+            if(src[idx+1]>maxG) maxG=src[idx+1];
+            if(src[idx+2]>maxB) maxB=src[idx+2];
+          }
+        }
+        const oi=(by*bw+bx)*4;
+        smallData.data[oi]=maxR; smallData.data[oi+1]=maxG; smallData.data[oi+2]=maxB; smallData.data[oi+3]=255;
+      }
+    }
+    sctx.putImageData(smallData,0,0);
+    const big = document.createElement('canvas'); big.width=w; big.height=h;
+    const bctx = big.getContext('2d'); bctx.imageSmoothingEnabled=true; bctx.imageSmoothingQuality='high';
+    bctx.drawImage(small,0,0,w,h);
+    return bctx.getImageData(0,0,w,h).data;
+  }
+  function removeShadows(canvas, strength){
+    const w=canvas.width, h=canvas.height, ctx=canvas.getContext('2d');
+    const src = ctx.getImageData(0,0,w,h);
+    const blockSize = Math.max(8, Math.round(Math.min(w,h)/40));
+    const bg = computeBackgroundMap(canvas, blockSize);
+    const d = src.data;
+    const amt = Math.max(0,Math.min(100,strength))/100;
+    for(let i=0;i<d.length;i+=4){
+      for(let c=0;c<3;c++){
+        const bgVal = Math.max(bg[i+c],25);
+        const gain = Math.min(4, 250/bgVal); // cap gain so near-black shadow noise isn't blown out
+        let corrected = d[i+c]*gain;
+        corrected = corrected<0?0:corrected>255?255:corrected;
+        d[i+c] = d[i+c] + (corrected-d[i+c])*amt; // blend original -> corrected by strength
+      }
+    }
+    ctx.putImageData(src,0,0);
+  }
+  function applyPixelFilter(canvas, opts){
+    const filter = opts.filter||'none', brightness=opts.brightness||0, contrast=opts.contrast||0,
+          saturation=opts.saturation||0, sharpen=opts.sharpen||0,
+          shadowRemove=!!opts.shadowRemove, shadowStrength=opts.shadowStrength!=null?opts.shadowStrength:70;
+    const ctx = canvas.getContext('2d'), w=canvas.width, h=canvas.height;
+    if(filter==='adaptive'){ adaptiveThreshold(canvas, contrast, brightness); return; }
+    if(shadowRemove) removeShadows(canvas, shadowStrength);
+    if(filter==='none' && brightness===0 && contrast===0 && saturation===0 && sharpen===0) return;
+    let effB=brightness, effC=contrast, effS=saturation;
+    if(filter==='enhance'){ effB+=8; effC+=35; }
+    if(filter==='bw'){ effC+=20; }
+    if(filter==='magic'){ effS+=30; effC+=12; }
+    const cAmt = effC*2.55;
+    const cFactor = (259*(cAmt+255))/(255*(259-cAmt));
+    const imgData = ctx.getImageData(0,0,w,h);
+    const d = imgData.data;
+    for(let i=0;i<d.length;i+=4) colorPixel(d,i,filter,effB,effC,effS,cFactor);
+    if(sharpen>0) sharpenImageData(imgData, w, h, sharpen/50);
+    ctx.putImageData(imgData,0,0);
+  }
+  function loadImage(src){
+    return new Promise(res=>{ const im=new Image(); im.onload=()=>res(im); im.src=src; });
+  }
+  async function bakeShotFilter(shot){
+    const im = await loadImage(shot.orig);
+    const c = document.createElement('canvas'); c.width=im.naturalWidth; c.height=im.naturalHeight;
+    c.getContext('2d').drawImage(im,0,0);
+    applyPixelFilter(c, {filter:shot.filter, brightness:shot.brightness, contrast:shot.contrast, saturation:shot.saturation, sharpen:shot.sharpen, shadowRemove:shot.shadowRemove, shadowStrength:shot.shadowStrength});
+    shot.edited = c.toDataURL('image/jpeg',0.92);
+  }
+
+  // ---- main panel ----
+  function renderScanPanel(){
+    panelShell('📷','Scan to PDF','Capture pages with your camera or add photos. Tap ✎ on any page to crop it and apply a scan filter, then combine everything into a PDF.', `
+      <div style="text-align:center;">
+        <video id="camVideo" autoplay playsinline style="width:100%;max-width:480px;border-radius:10px;background:#000;"></video>
+        <div style="margin-top:10px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+          <button class="secondary" id="startCam">Enable camera</button>
+          <button class="secondary" id="capture" disabled>Capture page</button>
+          <button class="secondary" id="switchCam" disabled>Switch camera</button>
+          <button class="secondary" id="addFiles">Add photos</button>
+        </div>
       </div>
-    </div>
-    <div class="thumbs" id="shots"></div>
-    <button class="primary" id="go" disabled>Create PDF</button>
-  `);
-  let facing='environment';
+      <div class="thumbs" id="shots"></div>
+      <label class="field">Filter for new pages</label>
+      ${filterChipsHtml('defFilterChips')}
+      <button class="primary" id="go" disabled>Create PDF</button>
+    `);
+    document.querySelectorAll('#defFilterChips .chip').forEach(chip=>{
+      if(chip.dataset.f===defaultFilter) chip.classList.add('active');
+      chip.onclick = ()=>{
+        document.querySelectorAll('#defFilterChips .chip').forEach(c=>c.classList.remove('active'));
+        chip.classList.add('active');
+        defaultFilter = chip.dataset.f;
+      };
+    });
+    if(stream){
+      document.getElementById('camVideo').srcObject = stream;
+      document.getElementById('capture').disabled=false;
+      document.getElementById('switchCam').disabled=false;
+    }
+    document.getElementById('startCam').onclick = startCamera;
+    document.getElementById('switchCam').onclick = ()=>{ facing = facing==='environment' ? 'user' : 'environment'; startCamera(); };
+    document.getElementById('capture').onclick = capturePage;
+    document.getElementById('addFiles').onclick = ()=>{
+      const input=document.createElement('input');
+      input.type='file'; input.accept='image/*'; input.multiple=true;
+      input.onchange = ()=>{ [...input.files].forEach(f=>{
+        const r=new FileReader(); r.onload=()=>addShot(r.result); r.readAsDataURL(f);
+      }); };
+      input.click();
+    };
+    document.getElementById('go').onclick = createPdf;
+    renderShots();
+  }
+
   async function startCamera(){
     try{
       if(stream) stream.getTracks().forEach(t=>t.stop());
@@ -1440,32 +1652,172 @@ BUILDERS.scan = function(){
       setStatus('');
     }catch(e){ setStatus('Could not access the camera: '+e.message+'. Your browser/device may not support this, or permission was denied.'); }
   }
-  document.getElementById('startCam').onclick = startCamera;
-  document.getElementById('switchCam').onclick = ()=>{ facing = facing==='environment' ? 'user' : 'environment'; startCamera(); };
-  function renderShots(){
-    const wrap = document.getElementById('shots'); wrap.innerHTML='';
-    shots.forEach((b64,i)=>{
-      const div=document.createElement('div'); div.className='thumb';
-      div.innerHTML = `<img src="${b64}"><div class="idx">Page ${i+1}</div><div class="tools"><button class="secondary">✕</button></div>`;
-      div.querySelector('button').onclick = ()=>{ shots.splice(i,1); renderShots(); };
-      wrap.appendChild(div);
-    });
-    document.getElementById('go').disabled = shots.length===0;
-  }
-  document.getElementById('capture').onclick = ()=>{
+  function capturePage(){
     const video = document.getElementById('camVideo');
     const canvas = document.createElement('canvas');
     canvas.width = video.videoWidth; canvas.height = video.videoHeight;
     canvas.getContext('2d').drawImage(video,0,0);
-    shots.push(canvas.toDataURL('image/jpeg',0.92));
-    renderShots();
-  };
-  document.getElementById('go').onclick = async ()=>{
+    addShot(canvas.toDataURL('image/jpeg',0.92));
+  }
+  function addShot(dataUrl){
+    const shot = {orig:dataUrl, edited:dataUrl, filter:defaultFilter, brightness:0, contrast:0, saturation:0, sharpen:0, shadowRemove:false, shadowStrength:70, crop:null};
+    shots.push(shot);
+    if(defaultFilter!=='none'){ bakeShotFilter(shot).then(renderShots); } else { renderShots(); }
+  }
+  function renderShots(){
+    const wrap = document.getElementById('shots'); if(!wrap) return;
+    wrap.innerHTML='';
+    shots.forEach((shot,i)=>{
+      const div=document.createElement('div'); div.className='thumb';
+      div.innerHTML = `<img src="${shot.edited}"><div class="idx">Page ${i+1}</div><div class="tools"><button class="secondary" data-a="edit">✎ Crop/filter</button><button class="secondary" data-a="del">✕</button></div>`;
+      div.querySelector('[data-a=edit]').onclick = ()=> openEditor(i);
+      div.querySelector('[data-a=del]').onclick = ()=>{ shots.splice(i,1); renderShots(); };
+      wrap.appendChild(div);
+    });
+    const goBtn = document.getElementById('go');
+    if(goBtn) goBtn.disabled = shots.length===0;
+  }
+
+  // ---- per-page editor: drag-to-crop + filters + brightness/contrast/saturation/sharpen ----
+  async function openEditor(idx){
+    const shot = shots[idx];
+    const img = await loadImage(shot.orig);
+    panelShell('✂️','Edit page '+(idx+1),'Drag on the image to select a crop area, then pick a filter and fine-tune it. Saving keeps the full original resolution.', `
+      <div style="text-align:center;">
+        <canvas id="editCanvas" style="max-width:100%;max-height:44vh;border-radius:8px;cursor:crosshair;touch-action:none;display:inline-block;"></canvas>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:center;margin-top:8px;flex-wrap:wrap;">
+        <button class="secondary" id="cropClear">Clear crop</button>
+      </div>
+      <label class="field">Filter</label>
+      ${filterChipsHtml('editFilterChips')}
+      <div class="checkrow">
+        <input type="checkbox" id="shadowToggle" ${shot.shadowRemove?'checked':''}>
+        <label for="shadowToggle">Remove shadows / even out lighting</label>
+      </div>
+      <label class="field" id="shadowStrengthLabel" style="${shot.shadowRemove?'':'display:none;'}">Shadow removal strength</label>
+      <input type="range" id="shadowStrength" min="0" max="100" value="${shot.shadowStrength}" style="${shot.shadowRemove?'':'display:none;'}">
+      <label class="field">Brightness</label>
+      <input type="range" id="brightness" min="-100" max="100" value="${shot.brightness}">
+      <label class="field">Contrast</label>
+      <input type="range" id="contrast" min="-100" max="100" value="${shot.contrast}">
+      <label class="field">Saturation</label>
+      <input type="range" id="saturation" min="-100" max="100" value="${shot.saturation}">
+      <label class="field">Sharpen</label>
+      <input type="range" id="sharpen" min="0" max="100" value="${shot.sharpen}">
+      <div style="display:flex;gap:10px;margin-top:18px;">
+        <button class="secondary" id="editCancel" style="flex:1;">Cancel</button>
+        <button class="primary" id="editSave" style="flex:1;margin-top:0;">Save page</button>
+      </div>
+    `);
+
+    const canvas = document.getElementById('editCanvas');
+    const maxDim = 1000;
+    const scale = Math.min(1, maxDim/Math.max(img.naturalWidth, img.naturalHeight));
+    canvas.width = Math.round(img.naturalWidth*scale);
+    canvas.height = Math.round(img.naturalHeight*scale);
+    const ratio = img.naturalWidth/canvas.width; // preview-px -> original-px
+
+    let curFilter = shot.filter, curBrightness = shot.brightness, curContrast = shot.contrast,
+        curSaturation = shot.saturation, curSharpen = shot.sharpen,
+        curShadowRemove = shot.shadowRemove, curShadowStrength = shot.shadowStrength;
+    // convert any stored orig-space crop into preview-space for display
+    let crop = shot.crop ? {x:shot.crop.x/ratio, y:shot.crop.y/ratio, w:shot.crop.w/ratio, h:shot.crop.h/ratio} : null;
+    let selecting=false, selStart=null, selCur=null;
+
+    function rectFromPoints(a,b){
+      return {x:Math.min(a.x,b.x), y:Math.min(a.y,b.y), w:Math.abs(b.x-a.x), h:Math.abs(b.y-a.y)};
+    }
+    function drawCropOverlay(ctx, rect){
+      ctx.save();
+      ctx.fillStyle='rgba(0,0,0,.5)';
+      ctx.beginPath();
+      ctx.rect(0,0,canvas.width,canvas.height);
+      ctx.rect(rect.x, rect.y, rect.w, rect.h);
+      ctx.fill('evenodd');
+      ctx.restore();
+      ctx.strokeStyle='#ff5b57';
+      ctx.lineWidth=2;
+      ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    }
+    function redraw(){
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      ctx.drawImage(img,0,0,canvas.width,canvas.height);
+      applyPixelFilter(canvas, {filter:curFilter, brightness:curBrightness, contrast:curContrast, saturation:curSaturation, sharpen:curSharpen, shadowRemove:curShadowRemove, shadowStrength:curShadowStrength});
+      if(selecting && selStart && selCur) drawCropOverlay(ctx, rectFromPoints(selStart,selCur));
+      else if(crop) drawCropOverlay(ctx, crop);
+    }
+    function getPos(e){
+      const rect = canvas.getBoundingClientRect();
+      const cx = e.touches ? e.touches[0].clientX : e.clientX;
+      const cy = e.touches ? e.touches[0].clientY : e.clientY;
+      const x = (cx-rect.left)*(canvas.width/rect.width);
+      const y = (cy-rect.top)*(canvas.height/rect.height);
+      return {x:Math.max(0,Math.min(canvas.width,x)), y:Math.max(0,Math.min(canvas.height,y))};
+    }
+    function onDown(e){ e.preventDefault(); selecting=true; selStart=getPos(e); selCur=selStart; redraw(); }
+    function onMove(e){ if(!selecting) return; e.preventDefault(); selCur=getPos(e); redraw(); }
+    function onUp(){
+      if(!selecting) return;
+      selecting=false;
+      const r = rectFromPoints(selStart,selCur);
+      crop = (r.w>10 && r.h>10) ? r : crop;
+      selStart=null; selCur=null;
+      redraw();
+    }
+    canvas.addEventListener('mousedown',onDown);
+    canvas.addEventListener('mousemove',onMove);
+    window.addEventListener('mouseup',onUp);
+    canvas.addEventListener('touchstart',onDown,{passive:false});
+    canvas.addEventListener('touchmove',onMove,{passive:false});
+    canvas.addEventListener('touchend',onUp);
+
+    document.getElementById('cropClear').onclick = ()=>{ crop=null; redraw(); };
+    document.querySelectorAll('#editFilterChips .chip').forEach(chip=>{
+      if(chip.dataset.f===curFilter) chip.classList.add('active');
+      chip.onclick = ()=>{
+        document.querySelectorAll('#editFilterChips .chip').forEach(c=>c.classList.remove('active'));
+        chip.classList.add('active');
+        curFilter = chip.dataset.f;
+        redraw();
+      };
+    });
+    document.getElementById('brightness').oninput = e=>{ curBrightness=parseInt(e.target.value,10); redraw(); };
+    document.getElementById('contrast').oninput = e=>{ curContrast=parseInt(e.target.value,10); redraw(); };
+    document.getElementById('saturation').oninput = e=>{ curSaturation=parseInt(e.target.value,10); redraw(); };
+    document.getElementById('sharpen').oninput = e=>{ curSharpen=parseInt(e.target.value,10); redraw(); };
+    document.getElementById('shadowToggle').onchange = e=>{
+      curShadowRemove = e.target.checked;
+      document.getElementById('shadowStrengthLabel').style.display = curShadowRemove ? '' : 'none';
+      document.getElementById('shadowStrength').style.display = curShadowRemove ? '' : 'none';
+      redraw();
+    };
+    document.getElementById('shadowStrength').oninput = e=>{ curShadowStrength=parseInt(e.target.value,10); redraw(); };
+    document.getElementById('editCancel').onclick = renderScanPanel;
+    document.getElementById('editSave').onclick = ()=>{
+      const origCrop = crop ? {x:crop.x*ratio, y:crop.y*ratio, w:crop.w*ratio, h:crop.h*ratio} : null;
+      const cx = origCrop ? origCrop.x : 0, cy = origCrop ? origCrop.y : 0;
+      const cw = origCrop ? origCrop.w : img.naturalWidth, ch = origCrop ? origCrop.h : img.naturalHeight;
+      const out = document.createElement('canvas');
+      out.width = Math.max(1,Math.round(cw)); out.height = Math.max(1,Math.round(ch));
+      out.getContext('2d').drawImage(img, cx, cy, cw, ch, 0, 0, out.width, out.height);
+      applyPixelFilter(out, {filter:curFilter, brightness:curBrightness, contrast:curContrast, saturation:curSaturation, sharpen:curSharpen, shadowRemove:curShadowRemove, shadowStrength:curShadowStrength});
+      shot.edited = out.toDataURL('image/jpeg',0.92);
+      shot.filter=curFilter; shot.brightness=curBrightness; shot.contrast=curContrast;
+      shot.saturation=curSaturation; shot.sharpen=curSharpen; shot.shadowRemove=curShadowRemove;
+      shot.shadowStrength=curShadowStrength; shot.crop=origCrop;
+      renderScanPanel();
+    };
+    redraw();
+  }
+
+  async function createPdf(){
     setStatus('Building PDF...');
     try{
       const doc = await PDFDocument.create();
-      for(const b64 of shots){
-        const jpgBytes = Uint8Array.from(atob(b64.split(',')[1]), c=>c.charCodeAt(0));
+      for(const shot of shots){
+        const jpgBytes = Uint8Array.from(atob(shot.edited.split(',')[1]), c=>c.charCodeAt(0));
         const img = await doc.embedJpg(jpgBytes);
         const page = doc.addPage([img.width, img.height]);
         page.drawImage(img, {x:0,y:0,width:img.width,height:img.height});
@@ -1473,10 +1825,11 @@ BUILDERS.scan = function(){
       const out = await doc.save();
       showResult(new Blob([out],{type:'application/pdf'}), 'scanned.pdf');
       setStatus('Done.', true);
-      if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
     }catch(e){ setStatus('Error: '+e.message); }
-  };
+  }
+
   activeCleanup = ()=>{ if(stream) stream.getTracks().forEach(t=>t.stop()); };
+  renderScanPanel();
 };
 
 // ================= EXTRACT TEXT / MARKDOWN =================
