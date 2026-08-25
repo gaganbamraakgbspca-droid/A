@@ -1422,7 +1422,7 @@ BUILDERS.excel2pdf = function(){
 // processing happens locally via canvas.
 BUILDERS.scan = function(){
   let stream=null, facing='environment', defaultFilter='none';
-  let shots=[]; // {orig, edited, filter, brightness, contrast, saturation, sharpen, shadowRemove, shadowStrength, crop:{x,y,w,h}|null (orig-image pixel space)}
+  let shots=[]; // {orig, edited, filter, brightness, contrast, saturation, sharpen, shadowRemove, shadowStrength, crop:{tl,tr,br,bl}|null — four corner points {x,y} in orig-image pixel space, used for perspective "straighten" crop}
 
   const FILTERS = [
     {f:'none', label:'Original'},
@@ -1597,17 +1597,117 @@ BUILDERS.scan = function(){
     shot.edited = c.toDataURL('image/jpeg',0.92);
   }
 
+  // ---- perspective ("4-corner") crop: straighten a quadrilateral region of a
+  // photo into a flat rectangle, the same math document-scanner apps use when
+  // a page was photographed at an angle. ----
+  // Solves the 3x3 homography H (H[2][2]=1) mapping 4 points fromPts -> toPts,
+  // by Gaussian elimination on the underlying 8x8 linear system.
+  function computeHomography(fromPts, toPts){
+    const A=[], b=[];
+    for(let i=0;i<4;i++){
+      const x=fromPts[i][0], y=fromPts[i][1], X=toPts[i][0], Y=toPts[i][1];
+      A.push([x,y,1,0,0,0,-x*X,-y*X]); b.push(X);
+      A.push([0,0,0,x,y,1,-x*Y,-y*Y]); b.push(Y);
+    }
+    for(let col=0; col<8; col++){
+      let piv=col;
+      for(let r=col+1;r<8;r++) if(Math.abs(A[r][col])>Math.abs(A[piv][col])) piv=r;
+      [A[col],A[piv]]=[A[piv],A[col]]; [b[col],b[piv]]=[b[piv],b[col]];
+      const d = A[col][col] || 1e-12;
+      for(let r=0;r<8;r++){
+        if(r===col) continue;
+        const f = A[r][col]/d;
+        if(f===0) continue;
+        for(let c=col;c<8;c++) A[r][c]-=f*A[col][c];
+        b[r]-=f*b[col];
+      }
+    }
+    const u = A.map((row,i)=>b[i]/(row[i]||1e-12));
+    return [[u[0],u[1],u[2]],[u[3],u[4],u[5]],[u[6],u[7],1]];
+  }
+  function applyHomography(H, x, y){
+    const w = H[2][0]*x + H[2][1]*y + H[2][2];
+    return [ (H[0][0]*x+H[0][1]*y+H[0][2])/w, (H[1][0]*x+H[1][1]*y+H[1][2])/w ];
+  }
+  function bilinearSample(data, w, h, x, y){
+    if(x<0) x=0; else if(x>w-1) x=w-1;
+    if(y<0) y=0; else if(y>h-1) y=h-1;
+    const x0=Math.floor(x), y0=Math.floor(y), x1=Math.min(w-1,x0+1), y1=Math.min(h-1,y0+1);
+    const fx=x-x0, fy=y-y0;
+    const i00=(y0*w+x0)*4, i10=(y0*w+x1)*4, i01=(y1*w+x0)*4, i11=(y1*w+x1)*4;
+    const out=[0,0,0];
+    for(let c=0;c<3;c++){
+      const top = data[i00+c]*(1-fx)+data[i10+c]*fx;
+      const bot = data[i01+c]*(1-fx)+data[i11+c]*fx;
+      out[c] = top*(1-fy)+bot*fy;
+    }
+    return out;
+  }
+  function quadIsAxisAlignedRect(q, eps){
+    return Math.abs(q.tl.y-q.tr.y)<eps && Math.abs(q.bl.y-q.br.y)<eps &&
+           Math.abs(q.tl.x-q.bl.x)<eps && Math.abs(q.tr.x-q.br.x)<eps;
+  }
+  function warpQuadFromImage(img, q){
+    const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+    if(quadIsAxisAlignedRect(q,0.75)){
+      // fast path: an untouched / axis-aligned selection is a plain crop, no resampling needed
+      const x=Math.min(q.tl.x,q.bl.x), y=Math.min(q.tl.y,q.tr.y);
+      const w=Math.max(1,Math.round(Math.max(q.tr.x,q.br.x)-x)), h=Math.max(1,Math.round(Math.max(q.bl.y,q.br.y)-y));
+      const out=document.createElement('canvas'); out.width=w; out.height=h;
+      out.getContext('2d').drawImage(img, x, y, w, h, 0, 0, w, h);
+      return out;
+    }
+    const outW = Math.max(1, Math.round(Math.max(dist(q.tl,q.tr), dist(q.bl,q.br))));
+    const outH = Math.max(1, Math.round(Math.max(dist(q.tl,q.bl), dist(q.tr,q.br))));
+    const src = document.createElement('canvas');
+    src.width = img.naturalWidth; src.height = img.naturalHeight;
+    src.getContext('2d').drawImage(img,0,0);
+    const srcData = src.getContext('2d').getImageData(0,0,src.width,src.height).data;
+    const H = computeHomography(
+      [[0,0],[outW,0],[outW,outH],[0,outH]],
+      [[q.tl.x,q.tl.y],[q.tr.x,q.tr.y],[q.br.x,q.br.y],[q.bl.x,q.bl.y]]
+    );
+    const out = document.createElement('canvas'); out.width=outW; out.height=outH;
+    const octx = out.getContext('2d');
+    const outData = octx.createImageData(outW, outH);
+    for(let y=0;y<outH;y++){
+      for(let x=0;x<outW;x++){
+        const [sx,sy] = applyHomography(H, x+0.5, y+0.5);
+        const [r,g,b2] = bilinearSample(srcData, src.width, src.height, sx, sy);
+        const di=(y*outW+x)*4;
+        outData.data[di]=r; outData.data[di+1]=g; outData.data[di+2]=b2; outData.data[di+3]=255;
+      }
+    }
+    octx.putImageData(outData,0,0);
+    return out;
+  }
+
   // ---- main panel ----
+  let devices=[], currentDeviceId=null; // enumerated video inputs, populated once permission is granted
+
+  function cameraBlockReason(){
+    if(!window.isSecureContext){
+      return 'Camera access needs a secure context (HTTPS, or localhost). This page looks like it was opened over an insecure connection — e.g. as a local file, or a plain http:// address — so the browser blocks camera access here. Serve it over HTTPS (or from localhost), or use "Add photos" below instead.';
+    }
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      return 'This browser does not support camera capture. Please update your browser, or use "Add photos" below instead.';
+    }
+    return null;
+  }
+
   function renderScanPanel(){
+    const blockReason = cameraBlockReason();
     panelShell('📷','Scan to PDF','Capture pages with your camera or add photos. Tap ✎ on any page to crop it and apply a scan filter, then combine everything into a PDF.', `
       <div style="text-align:center;">
-        <video id="camVideo" autoplay playsinline style="width:100%;max-width:480px;border-radius:10px;background:#000;"></video>
+        <video id="camVideo" autoplay playsinline muted style="width:100%;max-width:480px;border-radius:10px;background:#000;"></video>
+        <div id="camNote" style="margin-top:8px;font-size:12px;color:var(--warn);text-align:left;${blockReason?'':'display:none;'}">${blockReason||''}</div>
         <div style="margin-top:10px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
-          <button class="secondary" id="startCam">Enable camera</button>
+          <button class="secondary" id="startCam" ${blockReason?'disabled':''}>Enable camera</button>
           <button class="secondary" id="capture" disabled>Capture page</button>
           <button class="secondary" id="switchCam" disabled>Switch camera</button>
           <button class="secondary" id="addFiles">Add photos</button>
         </div>
+        <select id="camDeviceSelect" style="margin-top:8px;display:none;max-width:320px;"></select>
       </div>
       <div class="thumbs" id="shots"></div>
       <label class="field">Filter for new pages</label>
@@ -1626,9 +1726,11 @@ BUILDERS.scan = function(){
       document.getElementById('camVideo').srcObject = stream;
       document.getElementById('capture').disabled=false;
       document.getElementById('switchCam').disabled=false;
+      refreshDeviceSelect();
     }
-    document.getElementById('startCam').onclick = startCamera;
-    document.getElementById('switchCam').onclick = ()=>{ facing = facing==='environment' ? 'user' : 'environment'; startCamera(); };
+    document.getElementById('startCam').onclick = ()=>startCamera();
+    document.getElementById('switchCam').onclick = ()=>{ facing = facing==='environment' ? 'user' : 'environment'; currentDeviceId=null; startCamera(); };
+    document.getElementById('camDeviceSelect').onchange = e=>{ currentDeviceId = e.target.value || null; startCamera(); };
     document.getElementById('capture').onclick = capturePage;
     document.getElementById('addFiles').onclick = ()=>{
       const input=document.createElement('input');
@@ -1642,15 +1744,62 @@ BUILDERS.scan = function(){
     renderShots();
   }
 
-  async function startCamera(){
+  async function refreshDeviceSelect(){
+    const sel = document.getElementById('camDeviceSelect');
+    if(!sel || !navigator.mediaDevices.enumerateDevices) return;
     try{
-      if(stream) stream.getTracks().forEach(t=>t.stop());
-      stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:facing}, audio:false});
-      document.getElementById('camVideo').srcObject = stream;
-      document.getElementById('capture').disabled=false;
-      document.getElementById('switchCam').disabled=false;
-      setStatus('');
-    }catch(e){ setStatus('Could not access the camera: '+e.message+'. Your browser/device may not support this, or permission was denied.'); }
+      devices = (await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');
+      if(devices.length>1){
+        sel.innerHTML = devices.map((d,i)=>`<option value="${d.deviceId}">${escHtml(d.label||('Camera '+(i+1)))}</option>`).join('');
+        if(currentDeviceId) sel.value = currentDeviceId;
+        sel.style.display='';
+      } else {
+        sel.style.display='none';
+      }
+    }catch(e){ /* enumeration is best-effort */ }
+  }
+
+  async function startCamera(){
+    const blockReason = cameraBlockReason();
+    if(blockReason){ setStatus(blockReason); return; }
+    setStatus('Requesting camera access...');
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    // Try, in order: the explicitly chosen device, a soft ("ideal") facing-mode
+    // preference, then finally just "any camera" — so a device that can't match
+    // an exact constraint still gets used instead of failing outright.
+    const attempts=[];
+    if(currentDeviceId) attempts.push({video:{deviceId:{exact:currentDeviceId}}, audio:false});
+    attempts.push({video:{facingMode:{ideal:facing}}, audio:false});
+    attempts.push({video:true, audio:false});
+    let lastErr=null;
+    for(const constraints of attempts){
+      try{ stream = await navigator.mediaDevices.getUserMedia(constraints); lastErr=null; break; }
+      catch(e){ lastErr=e; }
+    }
+    const note = document.getElementById('camNote');
+    if(lastErr){
+      let msg;
+      if(lastErr.name==='NotAllowedError' || lastErr.name==='PermissionDeniedError'){
+        msg = 'Camera permission was denied. Allow camera access for this page in your browser/site settings and try again — or use "Add photos" instead.';
+      } else if(lastErr.name==='NotFoundError' || lastErr.name==='DevicesNotFoundError'){
+        msg = 'No camera was found on this device. Use "Add photos" to import scans instead.';
+      } else if(lastErr.name==='NotReadableError' || lastErr.name==='TrackStartError'){
+        msg = 'The camera is already in use by another app or browser tab. Close it there and try again.';
+      } else if(lastErr.name==='OverconstrainedError'){
+        msg = 'None of your cameras matched the requested settings. Try "Switch camera" or pick one from the device list.';
+      } else {
+        msg = 'Could not access the camera: '+(lastErr.message||lastErr.name)+'.';
+      }
+      setStatus(msg);
+      if(note){ note.textContent = msg; note.style.display=''; }
+      return;
+    }
+    document.getElementById('camVideo').srcObject = stream;
+    document.getElementById('capture').disabled=false;
+    document.getElementById('switchCam').disabled=false;
+    if(note) note.style.display='none';
+    setStatus('Camera ready.', true);
+    refreshDeviceSelect();
   }
   function capturePage(){
     const video = document.getElementById('camVideo');
@@ -1678,16 +1827,16 @@ BUILDERS.scan = function(){
     if(goBtn) goBtn.disabled = shots.length===0;
   }
 
-  // ---- per-page editor: drag-to-crop + filters + brightness/contrast/saturation/sharpen ----
+  // ---- per-page editor: 4-corner perspective crop + filters + brightness/contrast/saturation/sharpen ----
   async function openEditor(idx){
     const shot = shots[idx];
     const img = await loadImage(shot.orig);
-    panelShell('✂️','Edit page '+(idx+1),'Drag on the image to select a crop area, then pick a filter and fine-tune it. Saving keeps the full original resolution.', `
+    panelShell('✂️','Edit page '+(idx+1),'Drag any of the four corner handles to trace the edges of the page — even if it was photographed at an angle. Saving straightens it into a flat rectangle at full original resolution.', `
       <div style="text-align:center;">
-        <canvas id="editCanvas" style="max-width:100%;max-height:44vh;border-radius:8px;cursor:crosshair;touch-action:none;display:inline-block;"></canvas>
+        <canvas id="editCanvas" style="max-width:100%;max-height:44vh;border-radius:8px;cursor:pointer;touch-action:none;display:inline-block;"></canvas>
       </div>
       <div style="display:flex;gap:8px;justify-content:center;margin-top:8px;flex-wrap:wrap;">
-        <button class="secondary" id="cropClear">Clear crop</button>
+        <button class="secondary" id="cropClear">Reset corners</button>
       </div>
       <label class="field">Filter</label>
       ${filterChipsHtml('editFilterChips')}
@@ -1721,32 +1870,46 @@ BUILDERS.scan = function(){
     let curFilter = shot.filter, curBrightness = shot.brightness, curContrast = shot.contrast,
         curSaturation = shot.saturation, curSharpen = shot.sharpen,
         curShadowRemove = shot.shadowRemove, curShadowStrength = shot.shadowStrength;
-    // convert any stored orig-space crop into preview-space for display
-    let crop = shot.crop ? {x:shot.crop.x/ratio, y:shot.crop.y/ratio, w:shot.crop.w/ratio, h:shot.crop.h/ratio} : null;
-    let selecting=false, selStart=null, selCur=null;
 
-    function rectFromPoints(a,b){
-      return {x:Math.min(a.x,b.x), y:Math.min(a.y,b.y), w:Math.abs(b.x-a.x), h:Math.abs(b.y-a.y)};
+    function fullQuad(){
+      return { tl:{x:0,y:0}, tr:{x:canvas.width,y:0}, br:{x:canvas.width,y:canvas.height}, bl:{x:0,y:canvas.height} };
     }
-    function drawCropOverlay(ctx, rect){
+    // convert any stored orig-space quad into preview-space for display; default is the full page
+    let quad = shot.crop ? {
+      tl:{x:shot.crop.tl.x/ratio, y:shot.crop.tl.y/ratio}, tr:{x:shot.crop.tr.x/ratio, y:shot.crop.tr.y/ratio},
+      br:{x:shot.crop.br.x/ratio, y:shot.crop.br.y/ratio}, bl:{x:shot.crop.bl.x/ratio, y:shot.crop.bl.y/ratio}
+    } : fullQuad();
+
+    const CORNER_KEYS = ['tl','tr','br','bl'];
+    const HANDLE_R = 15;
+    let dragKey = null;
+
+    function drawQuadOverlay(ctx){
       ctx.save();
       ctx.fillStyle='rgba(0,0,0,.5)';
       ctx.beginPath();
       ctx.rect(0,0,canvas.width,canvas.height);
-      ctx.rect(rect.x, rect.y, rect.w, rect.h);
+      ctx.moveTo(quad.tl.x,quad.tl.y); ctx.lineTo(quad.tr.x,quad.tr.y); ctx.lineTo(quad.br.x,quad.br.y); ctx.lineTo(quad.bl.x,quad.bl.y); ctx.closePath();
       ctx.fill('evenodd');
       ctx.restore();
-      ctx.strokeStyle='#ff5b57';
-      ctx.lineWidth=2;
-      ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+      ctx.strokeStyle='#ff5b57'; ctx.lineWidth=2;
+      ctx.beginPath();
+      ctx.moveTo(quad.tl.x,quad.tl.y); ctx.lineTo(quad.tr.x,quad.tr.y); ctx.lineTo(quad.br.x,quad.br.y); ctx.lineTo(quad.bl.x,quad.bl.y); ctx.closePath();
+      ctx.stroke();
+      CORNER_KEYS.forEach(k=>{
+        const p = quad[k];
+        ctx.beginPath(); ctx.arc(p.x,p.y,HANDLE_R,0,Math.PI*2);
+        ctx.fillStyle = (dragKey===k) ? '#ff8a65' : '#ffffff';
+        ctx.fill();
+        ctx.lineWidth=3; ctx.strokeStyle='#ff5b57'; ctx.stroke();
+      });
     }
     function redraw(){
       const ctx = canvas.getContext('2d');
       ctx.clearRect(0,0,canvas.width,canvas.height);
       ctx.drawImage(img,0,0,canvas.width,canvas.height);
       applyPixelFilter(canvas, {filter:curFilter, brightness:curBrightness, contrast:curContrast, saturation:curSaturation, sharpen:curSharpen, shadowRemove:curShadowRemove, shadowStrength:curShadowStrength});
-      if(selecting && selStart && selCur) drawCropOverlay(ctx, rectFromPoints(selStart,selCur));
-      else if(crop) drawCropOverlay(ctx, crop);
+      drawQuadOverlay(ctx);
     }
     function getPos(e){
       const rect = canvas.getBoundingClientRect();
@@ -1756,16 +1919,27 @@ BUILDERS.scan = function(){
       const y = (cy-rect.top)*(canvas.height/rect.height);
       return {x:Math.max(0,Math.min(canvas.width,x)), y:Math.max(0,Math.min(canvas.height,y))};
     }
-    function onDown(e){ e.preventDefault(); selecting=true; selStart=getPos(e); selCur=selStart; redraw(); }
-    function onMove(e){ if(!selecting) return; e.preventDefault(); selCur=getPos(e); redraw(); }
-    function onUp(){
-      if(!selecting) return;
-      selecting=false;
-      const r = rectFromPoints(selStart,selCur);
-      crop = (r.w>10 && r.h>10) ? r : crop;
-      selStart=null; selCur=null;
+    function nearestCorner(pos){
+      let best=null, bestD=Infinity;
+      CORNER_KEYS.forEach(k=>{
+        const d = Math.hypot(quad[k].x-pos.x, quad[k].y-pos.y);
+        if(d<bestD){ bestD=d; best=k; }
+      });
+      return bestD <= HANDLE_R*2.5 ? best : null;
+    }
+    function onDown(e){
+      e.preventDefault();
+      const pos = getPos(e);
+      dragKey = nearestCorner(pos);
+      if(dragKey){ quad[dragKey]=pos; redraw(); }
+    }
+    function onMove(e){
+      if(!dragKey) return;
+      e.preventDefault();
+      quad[dragKey] = getPos(e);
       redraw();
     }
+    function onUp(){ if(dragKey){ dragKey=null; redraw(); } }
     canvas.addEventListener('mousedown',onDown);
     canvas.addEventListener('mousemove',onMove);
     window.addEventListener('mouseup',onUp);
@@ -1773,7 +1947,7 @@ BUILDERS.scan = function(){
     canvas.addEventListener('touchmove',onMove,{passive:false});
     canvas.addEventListener('touchend',onUp);
 
-    document.getElementById('cropClear').onclick = ()=>{ crop=null; redraw(); };
+    document.getElementById('cropClear').onclick = ()=>{ quad=fullQuad(); redraw(); };
     document.querySelectorAll('#editFilterChips .chip').forEach(chip=>{
       if(chip.dataset.f===curFilter) chip.classList.add('active');
       chip.onclick = ()=>{
@@ -1795,18 +1969,21 @@ BUILDERS.scan = function(){
     };
     document.getElementById('shadowStrength').oninput = e=>{ curShadowStrength=parseInt(e.target.value,10); redraw(); };
     document.getElementById('editCancel').onclick = renderScanPanel;
-    document.getElementById('editSave').onclick = ()=>{
-      const origCrop = crop ? {x:crop.x*ratio, y:crop.y*ratio, w:crop.w*ratio, h:crop.h*ratio} : null;
-      const cx = origCrop ? origCrop.x : 0, cy = origCrop ? origCrop.y : 0;
-      const cw = origCrop ? origCrop.w : img.naturalWidth, ch = origCrop ? origCrop.h : img.naturalHeight;
-      const out = document.createElement('canvas');
-      out.width = Math.max(1,Math.round(cw)); out.height = Math.max(1,Math.round(ch));
-      out.getContext('2d').drawImage(img, cx, cy, cw, ch, 0, 0, out.width, out.height);
+    document.getElementById('editSave').onclick = async ()=>{
+      const saveBtn = document.getElementById('editSave');
+      saveBtn.disabled = true;
+      setStatus('Straightening page...');
+      await new Promise(r=>setTimeout(r,20)); // let the status message paint before the (possibly heavy) warp
+      const origQuad = {
+        tl:{x:quad.tl.x*ratio, y:quad.tl.y*ratio}, tr:{x:quad.tr.x*ratio, y:quad.tr.y*ratio},
+        br:{x:quad.br.x*ratio, y:quad.br.y*ratio}, bl:{x:quad.bl.x*ratio, y:quad.bl.y*ratio}
+      };
+      const out = warpQuadFromImage(img, origQuad);
       applyPixelFilter(out, {filter:curFilter, brightness:curBrightness, contrast:curContrast, saturation:curSaturation, sharpen:curSharpen, shadowRemove:curShadowRemove, shadowStrength:curShadowStrength});
       shot.edited = out.toDataURL('image/jpeg',0.92);
       shot.filter=curFilter; shot.brightness=curBrightness; shot.contrast=curContrast;
       shot.saturation=curSaturation; shot.sharpen=curSharpen; shot.shadowRemove=curShadowRemove;
-      shot.shadowStrength=curShadowStrength; shot.crop=origCrop;
+      shot.shadowStrength=curShadowStrength; shot.crop=origQuad;
       renderScanPanel();
     };
     redraw();
