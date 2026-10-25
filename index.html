@@ -279,7 +279,7 @@
 <header>
   <h1>PDF <span>Toolkit</span></h1>
   <p>A full PDF, Office and document workbench that runs entirely in your browser — nothing you upload ever leaves your device.</p>
-  <p class="note">"Offline" tools work with zero setup. it's never sent anywhere else.</p>
+  <p class="note">All tools work offline in your browser — your files are never uploaded anywhere.</p>
 </header>
 
 <div class="wrap">
@@ -452,11 +452,11 @@ const TOOLS = [
   // ---- edit & sign ----
   {id:'watermark', icon:'💧', cat:'edit', title:'Watermark', status:READY, desc:'Stamp text diagonally across every page.'},
   {id:'pagenum', icon:'🔢', cat:'edit', title:'Page numbers', status:READY, desc:'Add page numbers with a chosen position and format.'},
-  {id:'sign', icon:'✍️', cat:'edit', title:'Sign PDF', status:READY, desc:'Draw a signature and place it anywhere on a page.'},
+  {id:'sign', icon:'✍️', cat:'edit', title:'Sign PDF', status:READY, desc:'Draw, upload or type a signature, then drag and resize it into place on a live preview.'},
   {id:'fillform', icon:'🧾', cat:'edit', title:'Fill PDF Forms', status:READY, desc:'Detects fillable fields, lets you fill them, then flattens the result.'},
   {id:'redact', icon:'⬛', cat:'edit', title:'Redact PDF', status:READY, desc:'Draw boxes over sensitive content — marked pages are flattened so nothing can be copy-pasted out.'},
   // ---- security ----
-  {id:'unlock', icon:'🔓', cat:'security', title:'Unlock PDF', status:READY, desc:'Removes owner-password print/copy/edit restrictions (best effort — see details).'},
+  {id:'unlock', icon:'🔓', cat:'security', title:'Unlock PDF', status:READY, desc:'Choose a password-protected PDF, enter the password, and download an unlocked copy.'},
   // ---- utilities ----
   {id:'compress', icon:'🗜️', cat:'utility', title:'Compress PDF', status:READY, desc:'Shrink file size by re-encoding pages as images at a chosen quality.'},
   {id:'imgcompress', icon:'🖼️', cat:'utility', title:'Compress Image', status:READY, desc:'Shrink JPG, PNG or WebP images by quality and/or resizing — batch supported.'},
@@ -736,6 +736,18 @@ if(window.pdfjsLib){
 
 const BUILDERS = {};
 
+// Some PDFs (e.g. ones with incremental-update xref chains) come out broken
+// ("root object is missing or invalid") when pdf-lib loads and re-saves them directly.
+// Copying their pages into a fresh document always produces a clean, valid file.
+async function loadClean(bytes){
+  const src = await PDFDocument.load(bytes, {ignoreEncryption:true});
+  const out = await PDFDocument.create();
+  const pages = await out.copyPages(src, src.getPageIndices());
+  pages.forEach(p=>out.addPage(p));
+  return out;
+}
+
+
 // ================= MERGE =================
 BUILDERS.merge = function(){
   let files = [];
@@ -861,7 +873,7 @@ BUILDERS.rotate = function(){
     setStatus('Rotating...');
     try{
       const bytes = await readAsArrayBuffer(file);
-      const doc = await PDFDocument.load(bytes, {ignoreEncryption:true});
+      const doc = await loadClean(bytes);
       const angle = parseInt(document.getElementById('angle').value,10);
       doc.getPages().forEach(p=>{
         const cur = p.getRotation().angle || 0;
@@ -895,7 +907,7 @@ BUILDERS.crop = function(){
     setStatus('Cropping...');
     try{
       const bytes = await readAsArrayBuffer(file);
-      const doc = await PDFDocument.load(bytes, {ignoreEncryption:true});
+      const doc = await loadClean(bytes);
       const mt = parseFloat(document.getElementById('mt').value)||0;
       const mb = parseFloat(document.getElementById('mb').value)||0;
       const ml = parseFloat(document.getElementById('ml').value)||0;
@@ -1263,7 +1275,7 @@ BUILDERS.watermark = function(){
     setStatus('Applying watermark...');
     try{
       const bytes = await readAsArrayBuffer(file);
-      const doc = await PDFDocument.load(bytes, {ignoreEncryption:true});
+      const doc = await loadClean(bytes);
       const font = await doc.embedFont(StandardFonts.HelveticaBold);
       const text = document.getElementById('text').value || 'WATERMARK';
       const size = parseFloat(document.getElementById('size').value)||48;
@@ -1308,7 +1320,7 @@ BUILDERS.pagenum = function(){
     setStatus('Adding page numbers...');
     try{
       const bytes = await readAsArrayBuffer(file);
-      const doc = await PDFDocument.load(bytes, {ignoreEncryption:true});
+      const doc = await loadClean(bytes);
       const font = await doc.embedFont(StandardFonts.Helvetica);
       const pos = document.getElementById('pos').value;
       const fmt = document.getElementById('fmt').value || 'Page {n} of {total}';
@@ -2102,79 +2114,394 @@ BUILDERS.extractimg = function(){
 };
 
 // ================= SIGN PDF =================
+// Preview-style signer: see every page, add a signature (draw / upload a photo / type),
+// then drag it anywhere (even onto another page), resize from the corner, and save.
 BUILDERS.sign = function(){
-  let file=null, pdfBytes=null, pageCount=0;
-  panelShell('✍️','Sign PDF','Draw a signature and place it on a page.', `
+  let file=null, pdfBytes=null, pdfDoc=null;
+  let pageEls=[];            // [{wrap, canvas}]
+  let sigs=[];               // saved signatures [{url, aspect}]
+  let placements=[];         // [{id, sig, page, x, y, w, el}]  x,y,w are fractions of the page
+  let selected=null, uid=0, activeTab='draw', inkColor='#111111';
+  let uploadSource=null;     // canvas holding the uploaded image (before background removal)
+
+  panel.style.maxWidth='980px';
+
+  panelShell('✍️','Sign PDF','Open your PDF, create a signature (draw it, upload a photo of it, or type it), then drag it into place and resize it from the corner — just like Preview.', `
+    <style>
+      .sg-tabs{display:flex;gap:6px;margin:16px 0 10px;flex-wrap:wrap;}
+      .sg-tab{background:var(--panel2);border:1px solid var(--border);color:var(--muted);padding:7px 14px;border-radius:100px;font-size:13px;cursor:pointer;font-family:inherit;}
+      .sg-tab.active{background:var(--accent);border-color:var(--accent);color:#1b1b1b;font-weight:700;}
+      .sg-box{border:1px solid var(--border);border-radius:8px;background:#fff;}
+      .sg-checker{background-color:#fff;background-image:linear-gradient(45deg,#e6e6e6 25%,transparent 25%,transparent 75%,#e6e6e6 75%),linear-gradient(45deg,#e6e6e6 25%,transparent 25%,transparent 75%,#e6e6e6 75%);background-size:16px 16px;background-position:0 0,8px 8px;}
+      .sg-actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center;}
+      .sg-list{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;}
+      .sg-saved{background:#fff;border:2px solid var(--border);border-radius:8px;padding:4px;width:120px;cursor:pointer;position:relative;}
+      .sg-saved:hover{border-color:var(--accent);}
+      .sg-saved img{width:100%;display:block;}
+      .sg-saved .x{position:absolute;top:-8px;right:-8px;width:20px;height:20px;border-radius:50%;background:var(--panel2);border:1px solid var(--border);color:var(--text);font-size:11px;line-height:1;cursor:pointer;}
+      .sg-hint{font-size:12.5px;color:var(--muted);margin:12px 0 8px;line-height:1.5;}
+      .sg-pages{background:#2b2f3a;border:1px solid var(--border);border-radius:10px;padding:14px;max-height:62vh;overflow:auto;user-select:none;-webkit-user-select:none;}
+      .sg-page{position:relative;margin:0 auto 6px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.45);}
+      .sg-page canvas{display:block;width:100%;height:auto;}
+      .sg-plabel{text-align:center;color:#aab;font-size:11.5px;margin-bottom:14px;}
+      .sg-place{position:absolute;touch-action:none;cursor:move;border:1.5px dashed transparent;box-sizing:border-box;}
+      .sg-place img{display:block;width:100%;pointer-events:none;-webkit-user-drag:none;}
+      .sg-place.sel{border-color:#2f7bff;background:rgba(47,123,255,.06);}
+      .sg-place .h,.sg-place .d{display:none;position:absolute;}
+      .sg-place.sel .h,.sg-place.sel .d{display:block;}
+      .sg-place .h{right:-9px;bottom:-9px;width:18px;height:18px;border-radius:50%;background:#2f7bff;border:2px solid #fff;cursor:nwse-resize;touch-action:none;}
+      .sg-place .d{right:-9px;top:-9px;width:20px;height:20px;border-radius:50%;background:#e5484d;border:2px solid #fff;color:#fff;font-size:11px;line-height:14px;text-align:center;cursor:pointer;padding:0;}
+    </style>
     <div id="dz"></div>
     <div class="filelist" id="flist"></div>
-    <label class="field">Draw your signature</label>
-    <div style="border:1px solid var(--border);border-radius:8px;background:#fff;">
-      <canvas id="sigPad" width="560" height="160" style="width:100%;display:block;cursor:crosshair;touch-action:none;"></canvas>
+    <div id="work" style="display:none;">
+      <div class="sg-tabs">
+        <button class="sg-tab active" data-tab="draw" type="button">Draw</button>
+        <button class="sg-tab" data-tab="upload" type="button">Upload image</button>
+        <button class="sg-tab" data-tab="type" type="button">Type</button>
+        <select id="inkColor" style="width:auto;margin-left:auto;">
+          <option value="#111111">Black ink</option>
+          <option value="#1a3fa8">Blue ink</option>
+        </select>
+      </div>
+
+      <div id="tabDraw">
+        <div class="sg-box"><canvas id="sigPad" width="900" height="260" style="width:100%;display:block;cursor:crosshair;touch-action:none;"></canvas></div>
+        <div class="sg-actions"><button class="secondary" id="clearSig" type="button">Clear</button></div>
+      </div>
+
+      <div id="tabUpload" style="display:none;">
+        <div class="sg-actions" style="margin-top:0;">
+          <button class="secondary" id="pickImg" type="button">Choose signature photo…</button>
+          <label class="checkrow" style="margin:0;"><input type="checkbox" id="rmBg" checked> Remove white/grey background</label>
+        </div>
+        <div class="sg-box sg-checker" style="margin-top:10px;min-height:110px;display:flex;align-items:center;justify-content:center;">
+          <img id="upPreview" style="max-width:100%;max-height:200px;display:none;">
+          <span id="upHint" style="color:#777;font-size:13px;">No image chosen yet</span>
+        </div>
+      </div>
+
+      <div id="tabType" style="display:none;">
+        <div class="row">
+          <div style="flex:2;"><input type="text" id="typeText" placeholder="Type your name"></div>
+          <div><select id="typeFont">
+            <option value="'Brush Script MT','Segoe Script','Snell Roundhand',cursive">Script</option>
+            <option value="'Lucida Handwriting','Apple Chancery','Z003',cursive">Formal</option>
+            <option value="'Bradley Hand','Segoe Print','Comic Sans MS',cursive">Casual</option>
+          </select></div>
+        </div>
+        <div class="sg-box" style="margin-top:10px;"><canvas id="typePrev" width="900" height="200" style="width:100%;display:block;"></canvas></div>
+      </div>
+
+      <div class="sg-actions">
+        <button class="secondary" id="useSig" type="button" style="background:var(--accent);border-color:var(--accent);color:#1b1b1b;font-weight:700;padding:9px 16px;">Add signature to page</button>
+      </div>
+      <div class="sg-list" id="sigList"></div>
+
+      <div class="sg-hint">Drag the signature to move it (you can drop it on any page). Drag the blue corner to resize, the red × to remove it. With it selected, arrow keys nudge it and Delete removes it. Click a saved signature above to place another copy.</div>
+      <div class="sg-pages" id="pagesBox"></div>
     </div>
-    <div style="margin-top:8px;"><button class="secondary" id="clearSig">Clear</button></div>
-    <div class="row" style="margin-top:14px;">
-      <div><label class="field">Page</label><input type="number" id="pgNum" value="1" min="1"></div>
-      <div><label class="field">Width (% of page)</label><input type="number" id="sigW" value="30" min="5" max="100"></div>
-    </div>
-    <div class="row">
-      <div><label class="field">Horizontal position (%)</label><input type="number" id="sigX" value="60" min="0" max="100"></div>
-      <div><label class="field">Vertical position (%)</label><input type="number" id="sigY" value="85" min="0" max="100"></div>
-    </div>
-    <button class="primary" id="go" disabled>Place signature & save</button>
+    <button class="primary" id="go" disabled>Save signed PDF</button>
   `);
-  makeDropzone(document.getElementById('dz'),'application/pdf', false, async fs=>{
-    file=fs[0];
-    renderFileList(document.getElementById('flist'),[file],()=>{file=null;document.getElementById('go').disabled=true;});
-    pdfBytes = await readAsArrayBuffer(file);
-    const pdf = await pdfjsLib.getDocument({data:pdfBytes}).promise;
-    pageCount = pdf.numPages;
-    document.getElementById('pgNum').max = pageCount;
-    document.getElementById('go').disabled = false;
-  });
-  const canvas = document.getElementById('sigPad');
-  const ctx = canvas.getContext('2d');
-  ctx.lineWidth=2.5; ctx.lineCap='round'; ctx.strokeStyle='#111';
-  let drawing=false, hasDrawn=false;
-  function pos(e){
-    const r = canvas.getBoundingClientRect();
-    const cx = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
-    const cy = (e.touches ? e.touches[0].clientY : e.clientY) - r.top;
-    return {x: cx*canvas.width/r.width, y: cy*canvas.height/r.height};
-  }
-  function start(e){ drawing=true; hasDrawn=true; const p=pos(e); ctx.beginPath(); ctx.moveTo(p.x,p.y); e.preventDefault(); }
-  function move(e){ if(!drawing) return; const p=pos(e); ctx.lineTo(p.x,p.y); ctx.stroke(); e.preventDefault(); }
-  function end(){ drawing=false; }
-  canvas.addEventListener('mousedown', start);
-  canvas.addEventListener('mousemove', move);
-  window.addEventListener('mouseup', end);
-  canvas.addEventListener('touchstart', start);
-  canvas.addEventListener('touchmove', move);
-  canvas.addEventListener('touchend', end);
-  document.getElementById('clearSig').onclick = ()=>{ ctx.clearRect(0,0,canvas.width,canvas.height); hasDrawn=false; };
-  document.getElementById('go').onclick = async ()=>{
-    if(!hasDrawn){ setStatus('Draw a signature first.'); return; }
-    setStatus('Placing signature...');
+
+  const $ = id=>document.getElementById(id);
+  const pagesBox = $('pagesBox');
+
+  // ---------- file loading ----------
+  makeDropzone($('dz'),'application/pdf', false, async fs=>{
+    file=fs[0]; if(!file) return;
+    renderFileList($('flist'),[file],()=>{ file=null; pdfBytes=null; pdfDoc=null; pageEls=[]; placements=[]; selected=null; pagesBox.innerHTML=''; $('work').style.display='none'; $('go').disabled=true; });
+    setStatus('Loading pages...');
     try{
-      const sigPng = canvas.toDataURL('image/png');
-      const pngBytes = Uint8Array.from(atob(sigPng.split(',')[1]), c=>c.charCodeAt(0));
-      const doc = await PDFDocument.load(pdfBytes, {ignoreEncryption:true});
-      const img = await doc.embedPng(pngBytes);
-      const pages = doc.getPages();
-      let pn = parseInt(document.getElementById('pgNum').value,10)||1;
-      pn = Math.min(Math.max(pn,1), pages.length);
-      const page = pages[pn-1];
-      const {width, height} = page.getSize();
-      const wPct = (parseFloat(document.getElementById('sigW').value)||30)/100;
-      const xPct = (parseFloat(document.getElementById('sigX').value)||60)/100;
-      const yPct = (parseFloat(document.getElementById('sigY').value)||85)/100;
-      const sigW = width*wPct;
-      const sigH = sigW * (canvas.height/canvas.width);
-      const x = width*xPct - sigW/2;
-      const y = height*(1-yPct) - sigH/2;
-      page.drawImage(img, {x, y, width:sigW, height:sigH});
-      const out = await doc.save();
-      showResult(new Blob([out],{type:'application/pdf'}), 'signed.pdf');
-      setStatus('Done.', true);
+      pdfBytes = await readAsArrayBuffer(file);
+      pdfDoc = await pdfjsLib.getDocument({data:pdfBytes.slice(0)}).promise;
+      pageEls=[]; placements=[]; selected=null; pagesBox.innerHTML='';
+      $('work').style.display='block';
+      for(let i=1;i<=pdfDoc.numPages;i++){
+        setStatus(`Rendering page ${i} of ${pdfDoc.numPages}...`);
+        const page = await pdfDoc.getPage(i);
+        const base = page.getViewport({scale:1});
+        const vp = page.getViewport({scale:1.8});
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.floor(vp.width); canvas.height = Math.floor(vp.height);
+        await page.render({canvasContext:canvas.getContext('2d'), viewport:vp}).promise;
+        const wrap = document.createElement('div');
+        wrap.className='sg-page';
+        wrap.style.maxWidth = Math.round(base.width*1.35)+'px';
+        wrap.appendChild(canvas);
+        pagesBox.appendChild(wrap);
+        const lbl = document.createElement('div'); lbl.className='sg-plabel'; lbl.textContent=`Page ${i} of ${pdfDoc.numPages}`;
+        pagesBox.appendChild(lbl);
+        pageEls.push({wrap, canvas});
+      }
+      $('go').disabled = false;
+      setStatus('PDF loaded. Create a signature above, then add it to the page.', true);
+    }catch(e){
+      if(e && e.name==='PasswordException') setStatus('This PDF is password protected — unlock it first with the Unlock PDF tool.');
+      else setStatus('Error: '+(e.message||e));
+    }
+  });
+
+  // ---------- signature creation helpers ----------
+  function trimCanvas(c){
+    const w=c.width, h=c.height, d=c.getContext('2d').getImageData(0,0,w,h).data;
+    let x0=w, y0=h, x1=-1, y1=-1;
+    for(let y=0;y<h;y++){
+      for(let x=0;x<w;x++){
+        if(d[(y*w+x)*4+3]>12){ if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; }
+      }
+    }
+    if(x1<0) return null;
+    const pad=6; x0=Math.max(0,x0-pad); y0=Math.max(0,y0-pad); x1=Math.min(w-1,x1+pad); y1=Math.min(h-1,y1+pad);
+    const out=document.createElement('canvas'); out.width=x1-x0+1; out.height=y1-y0+1;
+    out.getContext('2d').drawImage(c,x0,y0,out.width,out.height,0,0,out.width,out.height);
+    return out;
+  }
+  function removeBackground(src){
+    const c=document.createElement('canvas'); c.width=src.width; c.height=src.height;
+    const ctx=c.getContext('2d'); ctx.drawImage(src,0,0);
+    const img=ctx.getImageData(0,0,c.width,c.height), d=img.data;
+    // estimate paper brightness as the ~90th percentile of luminance
+    const hist=new Uint32Array(256); const step=4*3;
+    let n=0;
+    for(let i=0;i<d.length;i+=step){ hist[Math.round(0.299*d[i]+0.587*d[i+1]+0.114*d[i+2])]++; n++; }
+    let acc=0, bg=255; const target=n*0.1;
+    for(let v=255;v>=0;v--){ acc+=hist[v]; if(acc>=target){ bg=v; break; } }
+    bg=Math.max(bg,120);
+    for(let i=0;i<d.length;i+=4){
+      const lum=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+      const t=bg-lum;
+      const a=Math.max(0,Math.min(1,(t-bg*0.12)/(bg*0.30)));
+      d[i]=d[i]*0.55; d[i+1]=d[i+1]*0.55; d[i+2]=d[i+2]*0.55; // deepen the ink
+      d[i+3]=Math.round(d[i+3]*a);
+    }
+    ctx.putImageData(img,0,0);
+    return c;
+  }
+  function toSig(canvas){
+    const t=trimCanvas(canvas);
+    if(!t) return null;
+    // keep stored image reasonably small
+    let out=t; const maxW=1200;
+    if(t.width>maxW){
+      out=document.createElement('canvas'); out.width=maxW; out.height=Math.max(1,Math.round(t.height*maxW/t.width));
+      out.getContext('2d').drawImage(t,0,0,out.width,out.height);
+    }
+    return {url:out.toDataURL('image/png'), aspect:out.height/out.width};
+  }
+
+  // ---------- tabs ----------
+  document.querySelectorAll('.sg-tab').forEach(b=>{
+    b.onclick=()=>{
+      activeTab=b.dataset.tab;
+      document.querySelectorAll('.sg-tab').forEach(x=>x.classList.toggle('active',x===b));
+      $('tabDraw').style.display = activeTab==='draw'?'block':'none';
+      $('tabUpload').style.display = activeTab==='upload'?'block':'none';
+      $('tabType').style.display = activeTab==='type'?'block':'none';
+      if(activeTab==='type') renderTyped();
+    };
+  });
+  $('inkColor').onchange=e=>{ inkColor=e.target.value; drawCtx.strokeStyle=inkColor; renderTyped(); };
+
+  // draw pad
+  const pad=$('sigPad'), drawCtx=pad.getContext('2d');
+  drawCtx.lineWidth=4; drawCtx.lineCap='round'; drawCtx.lineJoin='round'; drawCtx.strokeStyle=inkColor;
+  let drawing=false, last=null;
+  function padPos(e){ const r=pad.getBoundingClientRect(); return {x:(e.clientX-r.left)*pad.width/r.width, y:(e.clientY-r.top)*pad.height/r.height}; }
+  pad.addEventListener('pointerdown',e=>{ e.preventDefault(); pad.setPointerCapture(e.pointerId); drawing=true; last=padPos(e); drawCtx.strokeStyle=inkColor; drawCtx.beginPath(); drawCtx.arc(last.x,last.y,2,0,Math.PI*2); drawCtx.fillStyle=inkColor; drawCtx.fill(); });
+  pad.addEventListener('pointermove',e=>{
+    if(!drawing) return; e.preventDefault();
+    const p=padPos(e), mid={x:(last.x+p.x)/2,y:(last.y+p.y)/2};
+    drawCtx.beginPath(); drawCtx.moveTo(last.x,last.y); drawCtx.quadraticCurveTo(last.x,last.y,mid.x,mid.y); drawCtx.lineTo(p.x,p.y); drawCtx.stroke();
+    last=p;
+  });
+  const endDraw=()=>{ drawing=false; };
+  pad.addEventListener('pointerup',endDraw); pad.addEventListener('pointercancel',endDraw);
+  $('clearSig').onclick=()=>drawCtx.clearRect(0,0,pad.width,pad.height);
+
+  // upload tab
+  function refreshUploadPreview(){
+    if(!uploadSource) return;
+    const proc = $('rmBg').checked ? removeBackground(uploadSource) : uploadSource;
+    const t = trimCanvas(proc) || proc;
+    $('upPreview').src = t.toDataURL('image/png');
+    $('upPreview').style.display='block'; $('upHint').style.display='none';
+  }
+  $('rmBg').onchange=refreshUploadPreview;
+  $('pickImg').onclick=()=>{
+    const input=document.createElement('input'); input.type='file'; input.accept='image/*';
+    input.onchange=()=>{
+      const f=input.files[0]; if(!f) return;
+      const url=URL.createObjectURL(f); const im=new Image();
+      im.onload=()=>{
+        const s=Math.min(1,1400/Math.max(im.naturalWidth,im.naturalHeight));
+        const c=document.createElement('canvas'); c.width=Math.max(1,Math.round(im.naturalWidth*s)); c.height=Math.max(1,Math.round(im.naturalHeight*s));
+        c.getContext('2d').drawImage(im,0,0,c.width,c.height);
+        URL.revokeObjectURL(url);
+        uploadSource=c; refreshUploadPreview();
+      };
+      im.onerror=()=>{ URL.revokeObjectURL(url); setStatus('Could not read that image.'); };
+      im.src=url;
+    };
+    input.click();
+  };
+
+  // type tab
+  function renderTyped(){
+    const c=$('typePrev'), ctx=c.getContext('2d');
+    ctx.clearRect(0,0,c.width,c.height);
+    const text=$('typeText').value||'';
+    if(!text) return;
+    ctx.fillStyle=inkColor; ctx.textBaseline='middle'; ctx.textAlign='center';
+    let size=120; ctx.font=`italic ${size}px ${$('typeFont').value}`;
+    while(ctx.measureText(text).width>c.width-40 && size>24){ size-=4; ctx.font=`italic ${size}px ${$('typeFont').value}`; }
+    ctx.fillText(text,c.width/2,c.height/2);
+  }
+  $('typeText').oninput=renderTyped; $('typeFont').onchange=renderTyped;
+
+  function currentSignature(){
+    if(activeTab==='draw') return toSig(pad);
+    if(activeTab==='type') return toSig($('typePrev'));
+    if(!uploadSource) return null;
+    return toSig($('rmBg').checked ? removeBackground(uploadSource) : uploadSource);
+  }
+
+  $('useSig').onclick=()=>{
+    if(!pageEls.length){ setStatus('Open a PDF first.'); return; }
+    const sig=currentSignature();
+    if(!sig){ setStatus(activeTab==='draw' ? 'Draw your signature first.' : activeTab==='type' ? 'Type your name first.' : 'Choose a signature image first.'); return; }
+    sigs.push(sig); renderSigList(); placeSig(sig); setStatus('');
+  };
+  function renderSigList(){
+    const list=$('sigList'); list.innerHTML='';
+    sigs.forEach((s,i)=>{
+      const d=document.createElement('div'); d.className='sg-saved sg-checker'; d.title='Click to place another copy';
+      d.innerHTML=`<img src="${s.url}"><button class="x" type="button" title="Forget this signature">✕</button>`;
+      d.onclick=e=>{ if(e.target.classList.contains('x')){ sigs.splice(i,1); renderSigList(); return; } placeSig(s); };
+      list.appendChild(d);
+    });
+  }
+
+  // ---------- placement ----------
+  function visiblePageIndex(){
+    const box=pagesBox.getBoundingClientRect(); let best=0, bestV=-1;
+    pageEls.forEach((p,i)=>{
+      const r=p.wrap.getBoundingClientRect();
+      const v=Math.max(0, Math.min(r.bottom,box.bottom)-Math.max(r.top,box.top));
+      if(v>bestV){ bestV=v; best=i; }
+    });
+    return best;
+  }
+  function placeSig(sig){
+    const pi=visiblePageIndex(), wrap=pageEls[pi].wrap, r=wrap.getBoundingClientRect(), box=pagesBox.getBoundingClientRect();
+    const w=0.28, hFrac=w*r.width*sig.aspect/r.height;
+    const visTop=Math.max(r.top,box.top), visBot=Math.min(r.bottom,box.bottom);
+    const cy=((visTop+visBot)/2-r.top)/r.height;
+    const p={id:++uid, sig, page:pi, x:Math.max(0,0.5-w/2), y:Math.max(0,Math.min(1-hFrac,cy-hFrac/2)), w};
+    createEl(p); placements.push(p); select(p);
+  }
+  function updateEl(p){ p.el.style.left=(p.x*100)+'%'; p.el.style.top=(p.y*100)+'%'; p.el.style.width=(p.w*100)+'%'; }
+  function select(p){
+    selected=p;
+    placements.forEach(q=>q.el.classList.toggle('sel',q===p));
+  }
+  function removePlacement(p){
+    p.el.remove(); placements=placements.filter(q=>q!==p); if(selected===p) selected=null;
+  }
+  function pageAt(cx,cy){
+    for(let i=0;i<pageEls.length;i++){
+      const r=pageEls[i].wrap.getBoundingClientRect();
+      if(cx>=r.left && cx<=r.right && cy>=r.top && cy<=r.bottom) return i;
+    }
+    return -1;
+  }
+  function createEl(p){
+    const el=document.createElement('div'); el.className='sg-place';
+    el.innerHTML=`<img src="${p.sig.url}" draggable="false"><div class="h"></div><button class="d" type="button">✕</button>`;
+    p.el=el; pageEls[p.page].wrap.appendChild(el); updateEl(p);
+
+    el.addEventListener('pointerdown',e=>{
+      if(e.target.classList.contains('h') || e.target.classList.contains('d')) return;
+      e.preventDefault(); e.stopPropagation(); select(p);
+      const er=el.getBoundingClientRect(); const gx=e.clientX-er.left, gy=e.clientY-er.top;
+      const move=ev=>{
+        let pi=pageAt(ev.clientX,ev.clientY); if(pi<0) pi=p.page;
+        if(pi!==p.page){ p.page=pi; pageEls[pi].wrap.appendChild(el); }
+        const r=pageEls[p.page].wrap.getBoundingClientRect();
+        const hF=el.offsetHeight/r.height;
+        p.x=Math.max(0,Math.min(1-p.w,(ev.clientX-gx-r.left)/r.width));
+        p.y=Math.max(0,Math.min(Math.max(0,1-hF),(ev.clientY-gy-r.top)/r.height));
+        updateEl(p);
+      };
+      const up=()=>{ window.removeEventListener('pointermove',move); window.removeEventListener('pointerup',up); window.removeEventListener('pointercancel',up); };
+      window.addEventListener('pointermove',move); window.addEventListener('pointerup',up); window.addEventListener('pointercancel',up);
+    });
+
+    el.querySelector('.h').addEventListener('pointerdown',e=>{
+      e.preventDefault(); e.stopPropagation(); select(p);
+      const r0=pageEls[p.page].wrap.getBoundingClientRect(); const sx=e.clientX, w0=p.w;
+      const move=ev=>{
+        const r=pageEls[p.page].wrap.getBoundingClientRect();
+        let nw=w0+(ev.clientX-sx)/r0.width;
+        nw=Math.max(0.04,Math.min(1-p.x,nw));
+        // keep the bottom edge on the page too
+        const hF=nw*r.width*p.sig.aspect/r.height;
+        if(p.y+hF>1) nw=Math.max(0.04,(1-p.y)*r.height/(r.width*p.sig.aspect));
+        p.w=nw; updateEl(p);
+      };
+      const up=()=>{ window.removeEventListener('pointermove',move); window.removeEventListener('pointerup',up); window.removeEventListener('pointercancel',up); };
+      window.addEventListener('pointermove',move); window.addEventListener('pointerup',up); window.addEventListener('pointercancel',up);
+    });
+    el.querySelector('.d').addEventListener('pointerdown',e=>{ e.preventDefault(); e.stopPropagation(); });
+    el.querySelector('.d').addEventListener('click',e=>{ e.stopPropagation(); removePlacement(p); });
+  }
+  pagesBox.addEventListener('pointerdown',e=>{ if(!e.target.closest('.sg-place')) select(null); });
+
+  function onKey(e){
+    if(!selected) return;
+    const t=e.target; if(t && (t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT')) return;
+    const big=e.shiftKey?0.01:0.002; let used=true;
+    if(e.key==='Delete'||e.key==='Backspace') removePlacement(selected);
+    else if(e.key==='ArrowLeft') selected.x=Math.max(0,selected.x-big);
+    else if(e.key==='ArrowRight') selected.x=Math.min(1-selected.w,selected.x+big);
+    else if(e.key==='ArrowUp') selected.y=Math.max(0,selected.y-big);
+    else if(e.key==='ArrowDown') selected.y=Math.min(1,selected.y+big);
+    else used=false;
+    if(used){ e.preventDefault(); if(selected) updateEl(selected); }
+  }
+  document.addEventListener('keydown',onKey);
+  activeCleanup=()=>{ document.removeEventListener('keydown',onKey); panel.style.maxWidth=''; };
+
+  // ---------- save ----------
+  $('go').onclick=async ()=>{
+    if(!pdfBytes) return;
+    if(placements.length===0){ setStatus('Add a signature to the page first.'); return; }
+    setStatus('Saving signed PDF...');
+    try{
+      const doc=await loadClean(pdfBytes);
+      const pages=doc.getPages(); const cache=new Map();
+      for(const p of placements){
+        let emb=cache.get(p.sig.url);
+        if(!emb){
+          const bytes=Uint8Array.from(atob(p.sig.url.split(',')[1]),c=>c.charCodeAt(0));
+          emb=await doc.embedPng(bytes); cache.set(p.sig.url,emb);
+        }
+        const page=pages[p.page];
+        const {width:W,height:H}=page.getSize();
+        const angle=(((page.getRotation().angle||0)%360)+360)%360;
+        const dW=(angle===90||angle===270)?H:W, dH=(angle===90||angle===270)?W:H;
+        const dw=p.w*dW, dh=dw*p.sig.aspect;
+        const u=p.x*dW, v=p.y*dH+dh; // displayed bottom-left corner of the signature
+        let X,Y;
+        if(angle===0){ X=u; Y=H-v; }
+        else if(angle===90){ X=v; Y=u; }
+        else if(angle===180){ X=W-u; Y=v; }
+        else { X=W-v; Y=H-u; }
+        page.drawImage(emb,{x:X,y:Y,width:dw,height:dh,rotate:degrees(angle)});
+      }
+      const out=await doc.save();
+      showResult(new Blob([out],{type:'application/pdf'}), file.name.replace(/\.pdf$/i,'')+'-signed.pdf');
+      setStatus('Done — your signed PDF is ready to download below.', true);
     }catch(e){ setStatus('Error: '+e.message); }
   };
 };
@@ -2360,23 +2687,94 @@ BUILDERS.redact = function(){
 
 // ================= UNLOCK PDF =================
 BUILDERS.unlock = function(){
-  let file=null;
-  panelShell('🔓','Unlock PDF','Removes owner-password restrictions (printing/copying/editing locks).', `
-    <div class="warn-note">This can only remove permission restrictions set by an owner password. It cannot remove an open/user password you don't know — that requires the actual password to decrypt the file in the first place.</div>
+  let file=null, bytes=null;
+  panelShell('🔓','Unlock PDF','Choose a password-protected PDF, enter its password, and download an unlocked copy with no password or restrictions.', `
+    <div class="warn-note">You must know the password — this tool cannot guess or crack it. The unlocked copy is rebuilt page by page, so pages become images (a hidden text layer is added so text stays searchable/selectable where possible). Everything runs in your browser.</div>
     <div id="dz"></div>
     <div class="filelist" id="flist"></div>
-    <button class="primary" id="go" disabled>Remove restrictions</button>
+    <div id="pwWrap" style="display:none">
+      <label class="field">PDF password</label>
+      <input type="password" id="pw" placeholder="Enter password" autocomplete="off" style="width:100%;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 10px;font-size:13.5px;">
+      <div class="checkrow"><input type="checkbox" id="showpw"><label for="showpw">Show password</label></div>
+    </div>
+    <label class="field">Quality</label>
+    <select id="q"><option value="2.5">High (larger file)</option><option value="2" selected>Good</option><option value="1.5">Smaller file</option></select>
+    <button class="primary" id="go" disabled>Unlock PDF</button>
   `);
-  makeDropzone(document.getElementById('dz'),'application/pdf', false, fs=>{ file=fs[0]; renderFileList(document.getElementById('flist'),[file],()=>{file=null;document.getElementById('go').disabled=true;}); document.getElementById('go').disabled=false; });
-  document.getElementById('go').onclick = async ()=>{
-    setStatus('Removing restrictions...');
+  const goBtn=document.getElementById('go'), pwWrap=document.getElementById('pwWrap'), pw=document.getElementById('pw');
+  document.getElementById('showpw').onchange=e=>{ pw.type=e.target.checked?'text':'password'; };
+  makeDropzone(document.getElementById('dz'),'application/pdf,.pdf', false, async fs=>{
+    file=fs[0]; if(!file) return;
+    renderFileList(document.getElementById('flist'),[file],()=>{file=null;bytes=null;goBtn.disabled=true;pwWrap.style.display='none';});
+    document.getElementById('result').innerHTML='';
+    goBtn.disabled=false;
+    bytes=new Uint8Array(await readAsArrayBuffer(file));
+    // Probe: does it need a password?
     try{
-      const bytes = await readAsArrayBuffer(file);
-      const doc = await PDFDocument.load(bytes, {ignoreEncryption:true});
-      const out = await doc.save();
-      showResult(new Blob([out],{type:'application/pdf'}),'unlocked.pdf');
-      setStatus('Done. If this PDF also had an open password, it may still look unreadable in some viewers — that needs the actual password.', true);
-    }catch(e){ setStatus('Error: '+e.message+' — this file may need its open password entered in a full PDF reader first.'); }
+      const t=pdfjsLib.getDocument({data:bytes.slice(), password:''});
+      const d=await t.promise; d.destroy();
+      pwWrap.style.display='none';
+      setStatus('No password needed to open this file — it only has restrictions. Click Unlock PDF to remove them.', true);
+    }catch(e){
+      if(e && e.name==='PasswordException'){ pwWrap.style.display='block'; setStatus('This PDF is password protected. Enter the password and click Unlock PDF.'); pw.focus(); }
+      else setStatus('Error: '+(e.message||e));
+    }
+  });
+  goBtn.onclick = async ()=>{
+    if(!file||!bytes) return;
+    goBtn.disabled=true;
+    document.getElementById('result').innerHTML='';
+    let pdfDoc=null;
+    try{
+      setStatus('Opening PDF...');
+      try{
+        pdfDoc=await pdfjsLib.getDocument({data:bytes.slice(), password:pw.value||''}).promise;
+      }catch(e){
+        if(e && e.name==='PasswordException'){
+          pwWrap.style.display='block';
+          setStatus(e.code===2 ? 'Wrong password — please try again.' : 'This PDF needs a password. Please enter it above.');
+          goBtn.disabled=false; return;
+        }
+        throw e;
+      }
+      const scale=parseFloat(document.getElementById('q').value);
+      const out=await PDFDocument.create();
+      const font=await out.embedFont(StandardFonts.Helvetica);
+      for(let p=1;p<=pdfDoc.numPages;p++){
+        setStatus(`Unlocking page ${p} of ${pdfDoc.numPages}...`);
+        const page=await pdfDoc.getPage(p);
+        const vp=page.getViewport({scale});
+        const base=page.getViewport({scale:1});
+        const canvas=document.createElement('canvas');
+        canvas.width=Math.ceil(vp.width); canvas.height=Math.ceil(vp.height);
+        const ctx=canvas.getContext('2d');
+        ctx.fillStyle='#fff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+        await page.render({canvasContext:ctx, viewport:vp}).promise;
+        const jpg=await new Promise(r=>canvas.toBlob(r,'image/jpeg',0.92));
+        const img=await out.embedJpg(new Uint8Array(await jpg.arrayBuffer()));
+        const pg=out.addPage([base.width, base.height]);
+        pg.drawImage(img,{x:0,y:0,width:base.width,height:base.height});
+        // invisible text layer (best effort) so text stays searchable
+        try{
+          const tc=await page.getTextContent();
+          for(const it of tc.items){
+            if(!it.str||!it.str.trim()) continue;
+            const txt=it.str.replace(/[^\x20-\x7E]/g,'');
+            if(!txt) continue;
+            const size=Math.max(1,Math.abs(it.transform[3])||Math.abs(it.transform[0])||8);
+            pg.drawText(txt,{x:it.transform[4],y:it.transform[5],size,font,opacity:0});
+          }
+        }catch(_){}
+        canvas.width=canvas.height=0;
+        page.cleanup();
+      }
+      const outBytes=await out.save();
+      const name=file.name.replace(/\.pdf$/i,'')+'-unlocked.pdf';
+      showResult(new Blob([outBytes],{type:'application/pdf'}), name);
+      setStatus('Done — your unlocked PDF is ready to download below.', true);
+      pdfDoc.destroy();
+    }catch(e){ setStatus('Error: '+(e.message||e)); }
+    goBtn.disabled=false;
   };
 };
 
@@ -2541,7 +2939,7 @@ BUILDERS.workflow = function(){
     setStatus('Running workflow...');
     try{
       const bytes = await readAsArrayBuffer(file);
-      const doc = await PDFDocument.load(bytes, {ignoreEncryption:true});
+      const doc = await loadClean(bytes);
       if(document.getElementById('wRotate').checked){
         const angle = parseInt(document.getElementById('wRotateAngle').value,10);
         doc.getPages().forEach(p=>{ const cur=p.getRotation().angle||0; p.setRotation(degrees((cur+angle)%360)); });
