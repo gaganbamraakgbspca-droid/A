@@ -111,10 +111,12 @@ a.pay{display:block;text-decoration:none;text-align:center;width:100%;margin:0}
 .card:is(:hover,:focus-visible) .j1{opacity:0;transform:scale(.6) rotate(14deg)}.card:is(:hover,:focus-visible) .j2{opacity:1;transform:none}
 .stg .sh{transform-origin:100% 100%}.card:is(:hover,:focus-visible) .sh{transform:translateY(-7px) rotate(-22deg)}.card:is(:hover,:focus-visible) .lb{fill:var(--ok)}
 .logo polygon{stroke-linejoin:round;stroke-width:3}.cb{fill:var(--a);stroke:var(--a)}.cw{fill:var(--b);stroke:var(--b)}
+.snd{position:fixed;z-index:5;top:calc(12px + env(safe-area-inset-top,0px));right:14px;width:42px;height:42px;border-radius:50%;border:1px solid var(--line);background:var(--card);cursor:pointer;font-size:18px;transition:transform .25s cubic-bezier(.3,1.5,.5,1)}.snd:hover{transform:scale(1.12) rotate(-8deg)}.snd:active{transform:scale(.9)}
 </style>
 </head>
 <body>
 <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+<button id="snd" class="snd" title="Sound on/off" aria-label="Toggle sound">🔊</button>
 <main>
   <div class="hero">
     <svg id="lg" class="logo" viewBox="0 0 100 100" width="68" height="68"><polygon class="cb"/><polygon class="cw"/></svg>
@@ -137,6 +139,25 @@ a.pay{display:block;text-decoration:none;text-align:center;width:100%;margin:0}
 const {PDFDocument,degrees,rgb,StandardFonts}=PDFLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 const $=id=>document.getElementById(id);
+const SFX=(()=>{let ctx=null,on=true;try{on=localStorage.getItem('og-snd')!=='0';}catch(e){}
+ const C=()=>{if(!ctx){const A=window.AudioContext||window.webkitAudioContext;if(!A)return null;ctx=new A();}if(ctx.state==='suspended')ctx.resume();return ctx;};
+ const ok=()=>{const c=ctx;return c&&on&&c.state==='running'?c:null;};
+ const tone=(f,d,ty='sine',v=.08,s=0,f2)=>{const c=ok();if(!c)return;const o=c.createOscillator(),g=c.createGain(),n=c.currentTime+s;o.type=ty;o.frequency.setValueAtTime(f,n);if(f2)o.frequency.exponentialRampToValueAtTime(f2,n+d);g.gain.setValueAtTime(.0001,n);g.gain.exponentialRampToValueAtTime(v,n+.01);g.gain.exponentialRampToValueAtTime(.0001,n+d);o.connect(g).connect(c.destination);o.start(n);o.stop(n+d+.02);};
+ const noise=(d,v,hp)=>{const c=ok();if(!c)return;const b=c.createBuffer(1,Math.ceil(c.sampleRate*d),c.sampleRate),a=b.getChannelData(0);for(let i=0;i<a.length;i++)a[i]=(Math.random()*2-1)*(1-i/a.length);const s=c.createBufferSource(),f=c.createBiquadFilter(),g=c.createGain();s.buffer=b;f.type='highpass';f.frequency.value=hp;g.gain.value=v;s.connect(f).connect(g).connect(c.destination);s.start();};
+ return{wake:C,get on(){return on;},
+  toggle(){on=!on;try{localStorage.setItem('og-snd',on?'1':'0');}catch(e){}C();if(on)setTimeout(()=>this.click(),30);return on;},
+  hover(i=0){tone(520+(i%6)*70,.07,'sine',.022);},
+  click(){tone(420,.1,'triangle',.07,0,680);},
+  close(){tone(520,.1,'triangle',.05,0,300);},
+  add(){tone(700,.07,'sine',.06);tone(940,.1,'sine',.05,.07);},
+  fold(){noise(.2,.08,3000);tone(300,.22,'triangle',.03,0,560);},
+  unfold(){noise(.15,.05,2500);},
+  ok(){[523,659,784,1047].forEach((f,i)=>tone(f,.28,'sine',.07,i*.08));},
+  err(){tone(190,.3,'sawtooth',.05,0,110);},
+  pen(){noise(.05,.035,5000);},
+  place(){tone(320,.09,'square',.035,0,200);}};})();
+['pointerdown','keydown','touchstart'].forEach(e=>addEventListener(e,()=>SFX.wake(),{passive:true}));
+
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const buf=f=>f.arrayBuffer();
 const pdfBlob=b=>new Blob([b],{type:'application/pdf'});
@@ -241,7 +262,7 @@ const TOOLS=[
    const sp=$('sp'),cx=sp.getContext('2d');cx.lineWidth=3.5;cx.lineCap=cx.lineJoin='round';cx.strokeStyle='#111';let dn=0,lp;
    const pos=e=>{const r=sp.getBoundingClientRect();return[(e.clientX-r.left)*600/r.width,(e.clientY-r.top)*180/r.height];};
    sp.onpointerdown=e=>{sp.setPointerCapture(e.pointerId);dn=1;lp=pos(e);};
-   sp.onpointermove=e=>{if(!dn)return;const p=pos(e);cx.beginPath();cx.moveTo(...lp);cx.lineTo(...p);cx.stroke();lp=p;};
+   sp.onpointermove=e=>{if(!dn)return;const nw=performance.now();if(nw-(sp._t||0)>70){sp._t=nw;SFX.pen();}const p=pos(e);cx.beginPath();cx.moveTo(...lp);cx.lineTo(...p);cx.stroke();lp=p;};
    sp.onpointerup=sp.onpointercancel=()=>dn=0;
    let us=null;
    const fit=()=>{cx.clearRect(0,0,600,180);if(!us)return;let c=us;
@@ -271,7 +292,7 @@ const TOOLS=[
     for(let y=0;y<180;y++)for(let x=0;x<600;x++)if(d[(y*600+x)*4+3]>10){if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;}
     if(x1<0){st('Draw or type a signature first.',1);return;}st('');
     const o=document.createElement('canvas');o.width=x1-x0+1;o.height=y1-y0+1;o.getContext('2d').drawImage(c,x0,y0,o.width,o.height,0,0,o.width,o.height);
-    const p={p:t.cur,x:.35,y:.7,w:.28,u:o.toDataURL('image/png'),a:o.height/o.width};t.pl.push(p);t.sel=p;$('ssz').value=28;show();};
+    SFX.place();const p={p:t.cur,x:.35,y:.7,w:.28,u:o.toDataURL('image/png'),a:o.height/o.width};t.pl.push(p);t.sel=p;$('ssz').value=28;show();};
    show();},
   async run(fs,o,st){if(!this.pl||!this.pl.length)throw new Error('Place a signature on a page first.');st('Signing…');
    const d=await cleanDoc(await buf(fs[0])),ps=d.getPages();
@@ -342,13 +363,13 @@ function renderGrid(){
     const c=document.createElement('button');c.className='card';c.style.setProperty('--i',i);
     c.innerHTML=`<span class="stg">${ANIM[t.id]||t.ic}</span><b>${t.t}</b><span class="d">${t.d}</span>`;
     c.onmousemove=e=>{const r=c.getBoundingClientRect();c.style.setProperty('--mx',(e.clientX-r.left)+'px');c.style.setProperty('--my',(e.clientY-r.top)+'px');};
-    c.onclick=()=>openTool(t);grid.appendChild(c);
+    c.onmouseenter=()=>SFX.hover(i);c.onclick=()=>{SFX.click();openTool(t);};grid.appendChild(c);
   });
 }
 $('q').oninput=renderGrid;renderGrid();
 
 const ov=$('ov'),sheet=$('sheet');let blobUrl=null;
-function close(){ov.classList.remove('on');sheet.innerHTML='';if(blobUrl){URL.revokeObjectURL(blobUrl);blobUrl=null;}}
+function close(){SFX.close();ov.classList.remove('on');sheet.innerHTML='';if(blobUrl){URL.revokeObjectURL(blobUrl);blobUrl=null;}}
 ov.onclick=e=>{if(e.target===ov)close();};
 document.addEventListener('keydown',e=>{if(e.key==='Escape')close();});
 
@@ -367,7 +388,7 @@ function openTool(t){
   ov.classList.add('on');
   $('cl').onclick=close;
   const dz=$('dz'),fi=$('fi');
-  const add=l=>{l=[...l];if(!l.length)return;files=t.multi?files.concat(l):[l[0]];draw();};
+  const add=l=>{l=[...l];if(!l.length)return;SFX.add();files=t.multi?files.concat(l):[l[0]];draw();};
   dz.onclick=()=>fi.click();fi.onchange=()=>{add(fi.files);fi.value='';};
   ['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag');}));
   ['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag');}));
@@ -395,8 +416,8 @@ function openTool(t){
       if(blobUrl)URL.revokeObjectURL(blobUrl);
       blobUrl=URL.createObjectURL(out[0].blob);
       $('res').innerHTML=`<a class="dl" href="${blobUrl}" download="${esc(out[0].name)}">⬇ Download ${esc(out[0].name)}</a>`;
-      if(!out[0].keep)st('All done ✨');
-    }catch(e){st(e.message||String(e),1);}
+      SFX.ok();if(!out[0].keep)st('All done ✨');
+    }catch(e){SFX.err();st(e.message||String(e),1);}
     $('bar').classList.remove('on');$('go').disabled=files.length<min;
   };
 }
@@ -415,10 +436,11 @@ function openTool(t){
  let cur=0,tg=0,raf=0,last=0;
  const draw=()=>{B.setAttribute('points',mix(SB,Math.min(cur,1.999)));W.setAttribute('points',mix(SW,Math.min(cur,1.999)));};
  const tick=n=>{const dt=Math.min(50,n-last);last=n;cur+=Math.sign(tg-cur)*Math.min(Math.abs(tg-cur),dt/650);draw();raf=cur===tg?0:requestAnimationFrame(tick);};
- const go=v=>{tg=v;if(!raf){last=performance.now();raf=requestAnimationFrame(tick);}};
+ const go=v=>{if(v!==tg)v?SFX.fold():SFX.unfold();tg=v;if(!raf){last=performance.now();raf=requestAnimationFrame(tick);}};
  draw();
  [L,document.querySelector('h1')].forEach(e=>{e.addEventListener('mouseenter',()=>go(2));e.addEventListener('mouseleave',()=>go(0));e.addEventListener('click',()=>go(tg?0:2));});
  setTimeout(()=>go(2),900);setTimeout(()=>go(0),4200);})();
+{const b=$('snd');const u=()=>{b.textContent=SFX.on?'🔊':'🔇';};u();b.onclick=()=>{SFX.toggle();u();};}
 </script>
 </body>
 </html>
